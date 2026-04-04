@@ -6,6 +6,8 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_chroma import Chroma
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
+from langchain_community.retrievers import BM25Retriever
+from langchain_classic.retrievers import EnsembleRetriever
 from langchain_core.messages import HumanMessage, AIMessage
 from html_templates import css, bot_template, user_template
 from prompts import build_prompt
@@ -56,9 +58,22 @@ def format_chat_history(chat_history):
             formatted.append(f"AI: {msg.content}")
     return "\n".join(formatted)
 
-def create_chain(vector_store, llm, chat_history):
-    retriever = vector_store.as_retriever(search_kwargs={"k": 4})
+def create_hybrid_retriever(vector_store, text_chunks):
+    # semantic retriever
+    semantic_retriever = vector_store.as_retriever(search_kwargs={"k":4})
 
+    # bm25 keyword retriever
+    bm25_retriever = BM25Retriever.from_documents(text_chunks)
+    bm25_retriever.k = 4
+
+    #hybrid retriever
+    hybrid_retriever = EnsembleRetriever(
+        retrievers=[bm25_retriever, semantic_retriever],
+        weights=[0.5, 0.5]
+    )
+    return hybrid_retriever
+
+def create_chain(retriever, llm, chat_history):
     chain = (
         {
             "context": retriever | format_docs,
@@ -76,7 +91,7 @@ def create_chain(vector_store, llm, chat_history):
 
 def handle_user_input(user_question):
     chain = create_chain(
-        st.session_state.vector_store,
+        st.session_state.retriever,
         st.session_state.llm,
         st.session_state.chat_history
     )
@@ -99,6 +114,9 @@ def main():
     st.set_page_config(page_title="Ask My Docs", page_icon=":books:")
 
     st.write(css, unsafe_allow_html=True)
+
+    if "retriever" not in st.session_state:
+        st.session_state.retriever = None
 
     if "vector_store" not in st.session_state:
         st.session_state.vector_store = None
@@ -128,7 +146,11 @@ def main():
 
                 vector_store = create_vector_store(text_chunks)
 
+                retriever = create_hybrid_retriever(vector_store, text_chunks)
+
                 st.session_state.vector_store = vector_store
+                st.session_state.retriever = retriever
+
                 st.success("Processing Complete!")
 
 if __name__ == '__main__':
