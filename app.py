@@ -10,7 +10,7 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_core.messages import HumanMessage, AIMessage
 from html_templates import css, bot_template, user_template
-from prompts import build_prompt
+from prompts import qa_prompt, rewrite_prompt
 import tempfile
 
 def get_pdf_text(pdf_docs):
@@ -73,6 +73,20 @@ def create_hybrid_retriever(vector_store, text_chunks):
     )
     return hybrid_retriever
 
+def rewrite_question(user_question, chat_history):
+    if not chat_history:
+        return user_question
+
+    rewriter = rewrite_prompt | ChatOpenAI(
+        model="gpt-3.5-turbo",
+        temperature=0
+    ) | StrOutputParser()
+
+    return rewriter.invoke({
+        "chat_history": format_chat_history(chat_history),
+        "question": user_question
+    })
+
 def create_chain(retriever, llm, chat_history):
     chain = (
         {
@@ -82,21 +96,22 @@ def create_chain(retriever, llm, chat_history):
                 lambda x: format_chat_history(chat_history)
             )
         }
-        | RunnableLambda(build_prompt)
+        | qa_prompt
         | llm
         | StrOutputParser()
     )
-
     return chain
 
 def handle_user_input(user_question):
+    rewritten_question = rewrite_question(user_question, st.session_state.chat_history)
+
     chain = create_chain(
         st.session_state.retriever,
         st.session_state.llm,
         st.session_state.chat_history
     )
-
-    response = chain.invoke(user_question)
+    print("rewritten question: ", rewritten_question)
+    response = chain.invoke(rewritten_question)
 
     st.session_state.chat_history.append(HumanMessage(content=user_question))
     st.session_state.chat_history.append(AIMessage(content=response))
