@@ -8,6 +8,9 @@ from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
+from langchain_classic.retrievers.contextual_compression import ContextualCompressionRetriever
+# from langchain_community.document_compressors import FlashrankRerank
+from langchain_cohere import CohereRerank
 from langchain_core.messages import HumanMessage, AIMessage
 from html_templates import css, bot_template, user_template
 from prompts import qa_prompt, rewrite_prompt
@@ -24,13 +27,16 @@ def get_pdf_text(pdf_docs):
         loader = PyPDFLoader(temp_path)
         docs = loader.load()
 
+        for d in docs:
+            d.metadata["source"] = doc.name
+
         documents.extend(docs)
     return documents
 
 def get_chunks(documents):
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size = 1000,
-        chunk_overlap = 200
+        chunk_size = 800,
+        chunk_overlap = 100
     )
     text_chunks = text_splitter.split_documents(documents)
     return text_chunks
@@ -49,6 +55,30 @@ def get_llm():
 def format_docs(docs):
     return "\n\n".join([doc.page_content for doc in docs])
 
+def get_sources(docs, score_threshold=0.5):
+    sources = []
+    seen = set()
+
+    for doc in docs:
+        score = doc.metadata.get("relevance_score", 0)
+
+        if score < score_threshold:
+            continue
+
+        filename = doc.metadata.get("source", "Unknown")
+        page = doc.metadata.get("page", "?")
+        filename = filename.split("/")[-1]
+        key = (filename, page)
+
+        if key not in seen:
+            seen.add(key)
+            sources.append({
+                "filename": filename,
+                "page": page + 1,
+            })
+
+    return sources
+
 def format_chat_history(chat_history):
     formatted = []
     for msg in chat_history:
@@ -60,18 +90,27 @@ def format_chat_history(chat_history):
 
 def create_hybrid_retriever(vector_store, text_chunks):
     # semantic retriever
-    semantic_retriever = vector_store.as_retriever(search_kwargs={"k":4})
+    semantic_retriever = vector_store.as_retriever(search_kwargs={"k":8})
 
     # bm25 keyword retriever
     bm25_retriever = BM25Retriever.from_documents(text_chunks)
-    bm25_retriever.k = 4
+    bm25_retriever.k = 8
 
     #hybrid retriever
     hybrid_retriever = EnsembleRetriever(
         retrievers=[bm25_retriever, semantic_retriever],
         weights=[0.5, 0.5]
     )
-    return hybrid_retriever
+
+    compressor = CohereRerank(
+        model="rerank-english-v3.0",
+        top_n = 4)
+    reranking_retriever = ContextualCompressionRetriever(
+        base_compressor=compressor,
+        base_retriever=hybrid_retriever
+    )
+
+    return reranking_retriever
 
 def rewrite_question(user_question, chat_history):
     if not chat_history:
@@ -87,10 +126,10 @@ def rewrite_question(user_question, chat_history):
         "question": user_question
     })
 
-def create_chain(retriever, llm, chat_history):
+def create_chain(context, llm, chat_history):
     chain = (
         {
-            "context": retriever | format_docs,
+            "context": RunnableLambda(lambda x: context),
             "question": RunnablePassthrough(),
             "chat_history": RunnableLambda(
                 lambda x: format_chat_history(chat_history)
@@ -105,8 +144,12 @@ def create_chain(retriever, llm, chat_history):
 def handle_user_input(user_question):
     rewritten_question = rewrite_question(user_question, st.session_state.chat_history)
 
+    retrieved_docs = st.session_state.retriever.invoke(rewritten_question)
+    sources = get_sources(retrieved_docs)
+    context = format_docs(retrieved_docs)
+
     chain = create_chain(
-        st.session_state.retriever,
+        context,
         st.session_state.llm,
         st.session_state.chat_history
     )
@@ -122,6 +165,10 @@ def handle_user_input(user_question):
         elif isinstance(msg, AIMessage):
             st.write(bot_template.replace("{{MSG}}", msg.content), unsafe_allow_html=True)
 
+    if sources:
+        with st.expander("Sources"):
+            for source in sources:
+                st.markdown(f"- **{source['filename']}** — Page {source['page']}")
 
 def main():
     load_dotenv()
