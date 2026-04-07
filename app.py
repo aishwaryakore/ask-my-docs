@@ -15,6 +15,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 from html_templates import css, bot_template, user_template
 from prompts import qa_prompt, rewrite_prompt
 import tempfile
+import config
 
 def get_pdf_text(pdf_docs):
     documents = []
@@ -35,14 +36,14 @@ def get_pdf_text(pdf_docs):
 
 def get_chunks(documents):
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size = 800,
-        chunk_overlap = 100
+        chunk_size = config.CHUNK_SIZE,
+        chunk_overlap = config.CHUNK_OVERLAP
     )
     text_chunks = text_splitter.split_documents(documents)
     return text_chunks
 
 def create_vector_store(text_chunks):
-    embeddings = OpenAIEmbeddings()
+    embeddings = OpenAIEmbeddings(model=config.EMBEDDING_MODEL)
     vector_store = Chroma.from_documents(
         embedding=embeddings,
         documents=text_chunks
@@ -50,19 +51,19 @@ def create_vector_store(text_chunks):
     return vector_store
 
 def get_llm():
-    return ChatOpenAI()
+    return ChatOpenAI(model=config.QA_MODEL)
 
 def format_docs(docs):
     return "\n\n".join([doc.page_content for doc in docs])
 
-def get_sources(docs, score_threshold=0.5):
+def get_sources(docs):
     sources = []
     seen = set()
 
     for doc in docs:
         score = doc.metadata.get("relevance_score", 0)
 
-        if score < score_threshold:
+        if score < config.RERANKER_SCORE_THRESHOLD:
             continue
 
         filename = doc.metadata.get("source", "Unknown")
@@ -90,21 +91,21 @@ def format_chat_history(chat_history):
 
 def create_hybrid_retriever(vector_store, text_chunks):
     # semantic retriever
-    semantic_retriever = vector_store.as_retriever(search_kwargs={"k":8})
+    semantic_retriever = vector_store.as_retriever(search_kwargs={"k" : config.RETRIEVER_K})
 
     # bm25 keyword retriever
     bm25_retriever = BM25Retriever.from_documents(text_chunks)
-    bm25_retriever.k = 8
+    bm25_retriever.k = config.RETRIEVER_K
 
     #hybrid retriever
     hybrid_retriever = EnsembleRetriever(
         retrievers=[bm25_retriever, semantic_retriever],
-        weights=[0.5, 0.5]
+        weights=config.ENSEMBLE_WEIGHTS
     )
 
     compressor = CohereRerank(
-        model="rerank-english-v3.0",
-        top_n = 4)
+        model=config.RERANKER_MODEL,
+        top_n = config.RERANKER_TOP_N)
     reranking_retriever = ContextualCompressionRetriever(
         base_compressor=compressor,
         base_retriever=hybrid_retriever
@@ -117,8 +118,8 @@ def rewrite_question(user_question, chat_history):
         return user_question
 
     rewriter = rewrite_prompt | ChatOpenAI(
-        model="gpt-3.5-turbo",
-        temperature=0
+        model=config.REWRITER_MODEL,
+        temperature=config.REWRITER_TEMPERATURE
     ) | StrOutputParser()
 
     return rewriter.invoke({
